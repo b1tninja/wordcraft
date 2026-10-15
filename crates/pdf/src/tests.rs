@@ -1808,6 +1808,30 @@ fn image_budget_is_checked_from_the_header() {
     let dims = image::ImageReader::new(std::io::Cursor::new(hdr.as_slice())).with_guessed_format().unwrap().into_dimensions().unwrap();
     assert_eq!(dims, (30_000, 30_000));
     assert!(load_image(&Arc::new(hdr)).is_none());
+/// The Print page's Grayscale box: every colour in the PDF is gray (Rec. 709), however the driver
+/// treats a monochrome request, and the setting does not leak into the next export.
+#[test]
+fn grayscale_export_converts_colours_and_pictures() {
+    let mut d = Document::new();
+    let media = d.add_media(red_right_half_emf(), "emf");
+    let mut p = Paragraph::with_text("Figure: ", CharProps::default());
+    let n = p.len();
+    p.insert_object(
+        n,
+        InlineObject::Image { media, w: 70.0, h: 70.0, alt: "red".into(), float: Default::default(), crop: [0.0; 4], ole: None },
+        &CharProps::default(),
+    )
+    .unwrap();
+    d.body = vec![para_block(p)];
+    let raw = |grayscale| {
+        String::from_utf8_lossy(&export(&d, &PdfOptions { compress: false, tagged: false, grayscale, ..Default::default() }).unwrap()).into_owned()
+    };
+    let gray = raw(true);
+    assert!(!gray.contains("1 0 0 rg"), "the red rectangle is no longer red");
+    let y = format!("{} {0} {0} rg", 53.0 / 255.0);
+    let level = &y[..6];
+    assert!(gray.contains(level), "the rectangle is filled with the Rec. 709 gray 53/255: {level}");
+    assert!(raw(false).contains("1 0 0 rg"), "the next, colour export is unaffected");
 }
 
 /// Scale to paper size (#2108): every page goes on the chosen paper, turned to the page's
