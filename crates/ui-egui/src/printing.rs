@@ -228,6 +228,30 @@ pub fn pwg_media(paper: &str) -> Option<&'static str> {
     })
 }
 
+/// The params of the PDF behind a submitted job. A submitted job never carries link annotations
+/// (the spooler or printer that fits pages to the paper can't move them), whatever the caller sent;
+/// only `file.printPdf` honours an explicit `annotations`.
+fn job_params(params: &serde_json::Value, gray: bool) -> serde_json::Value {
+    let mut pdf_params = params.clone();
+    if let Some(object) = pdf_params.as_object_mut() {
+        object.remove("annotations");
+        object.insert("grayscale".into(), serde_json::json!(gray));
+    }
+    pdf_params
+}
+
+/// The media a network job names. An explicit paper (the PDF's pages are scaled to it) wins; with
+/// none the pages' own sizes decide, and only when every page is the same known size. A mixed-size
+/// plan names no media, so no page's size is imposed on the others.
+fn network_media(params: &serde_json::Value, sizes: &[(f32, f32)]) -> Option<&'static str> {
+    if let Ok(Some((name, _, _))) = wordcraft_engine::print::paper(params) {
+        return pwg_media(name);
+    }
+    let mut media = sizes.iter().map(|&(w, h)| crate::network_print::media_for_points(w, h));
+    let first = media.next()??;
+    media.all(|m| m == Some(first)).then_some(first)
+}
+
 /// Build the upstream page-range/markup PDF and hand it to the chosen host print flow.
 pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     use serde_json::json;
@@ -244,12 +268,9 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
     } else if native && !app.printing.ready() {
         return Err("Select an available printer in File > Print before submitting.".into());
     }
-    let mut pdf_params = params.clone();
     // The pages themselves are gray when Grayscale is chosen; the driver is asked for monochrome too.
     let gray = grayscale(app);
-    if let Some(object) = pdf_params.as_object_mut() {
-        object.insert("grayscale".into(), json!(gray));
-    }
+    let mut pdf_params = job_params(params, gray);
     let mut settings = app.printing.settings.clone();
     let collate = params.get("collate").map(|value| value.as_bool().ok_or("collate must be a boolean")).transpose()?.unwrap_or(app.ui.print.collate);
     if native {
@@ -285,8 +306,8 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
         if network {
             // The sheet size picks the printer's media when it lists it; the page count is the job's total.
             let lay = app.session.export_layout();
-            let media =
-                plan.pages.first().and_then(|&index| lay.pages.get(index)).and_then(|page| crate::network_print::media_for_points(page.w, page.h));
+            let sizes: Vec<(f32, f32)> = plan.pages.iter().filter_map(|&index| lay.pages.get(index)).map(|page| (page.w, page.h)).collect();
+            let media = if sizes.len() == plan.pages.len() { network_media(params, &sizes) } else { None };
             if !crate::network_print::send(app, bytes, plan.pages.len(), media) {
                 return Err("Query the printer, then tick the confirmation box in File > Print before sending.".into());
             }
@@ -340,6 +361,42 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    const LETTER: (f32, f32) = (612.0, 792.0);
+    const A4: (f32, f32) = (595.3, 841.9);
+
+    /// A submitted job's PDF never carries link annotations, even when the caller asks for them.
+    #[test]
+    fn a_submitted_jobs_params_never_carry_annotations() {
+        for sent in [json!({"annotations": true}), json!({"annotations": false}), json!({})] {
+            let params = super::job_params(&sent, true);
+            assert!(params.get("annotations").is_none(), "{params}");
+            assert_eq!(params["grayscale"], true);
+        }
+        assert_eq!(super::job_params(&json!({"copies": 2}), false)["copies"], 2);
+    }
+
+    /// The explicit paper names the media; the layout size is only the fallback without one.
+    #[test]
+    fn network_media_follows_the_chosen_paper_before_the_layout() {
+        let letter_doc = [LETTER];
+        assert_eq!(super::network_media(&json!({"paper": "A4"}), &letter_doc), Some("iso_a4_210x297mm"));
+        assert_eq!(super::network_media(&json!({}), &letter_doc), Some("na_letter_8.5x11in"));
+        assert_eq!(super::network_media(&json!({"paper": "none"}), &letter_doc), Some("na_letter_8.5x11in"));
+        assert_eq!(super::network_media(&json!({"paper": "Legal"}), &[LETTER, A4]), Some("na_legal_8.5x14in"));
+    }
+
+    /// Only a plan whose pages are all one size names a media.
+    #[test]
+    fn network_media_is_sent_only_for_a_uniform_plan() {
+        assert_eq!(super::network_media(&json!({}), &[LETTER, LETTER, (792.0, 612.0)]), Some("na_letter_8.5x11in"), "landscape letter is letter");
+        assert_eq!(super::network_media(&json!({}), &[LETTER, A4]), None);
+        assert_eq!(super::network_media(&json!({}), &[A4, LETTER, LETTER]), None);
+        assert_eq!(super::network_media(&json!({}), &[LETTER, (500.0, 500.0)]), None);
+        assert_eq!(super::network_media(&json!({}), &[]), None);
+    }
+
     /// Every Layout › Size paper has a printer media name (#2108) the spooler accepts as a keyword.
     #[test]
     fn every_paper_size_has_a_media_name() {

@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use craft_ui::capability::Capability;
 use craft_ui::printing::network as net;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::network_print::{FORMATS, NetworkPrint};
@@ -137,4 +138,63 @@ fn a_job_that_finished_while_the_page_was_closed_is_announced_naming_the_printer
     app.poll_printing(&egui::Context::default());
     let status = app.status_msg.as_ref().map(|(text, _)| text.clone()).unwrap_or_default();
     assert!(status.contains("warnings"), "the outcome reaches the status bar: {status:?}");
+}
+
+const CONFIRM: &str = "I confirm sending this document to this printer";
+
+/// The app in a harness with the Print page open and the printer already queried.
+fn print_page(seen: &Rc<RefCell<Seen>>) -> egui_kittest::Harness<'static, WordApp> {
+    let mut app = app_with(service(seen, FORMATS, net::Outcome::Completed));
+    query(&mut app);
+    app.run("ui.backstage", json!({"value": true, "page": "print"})).unwrap();
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    harness.run_steps(4);
+    harness
+}
+
+#[test]
+fn ticking_the_confirmation_box_and_clicking_print_starts_one_job() {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let mut h = print_page(&seen);
+    assert!(!h.state().net_print.draft.confirmed, "never ticked by default");
+    h.get_by_label(CONFIRM).click();
+    h.run_steps(4);
+    assert!(h.state().net_print.draft.confirmed, "the checkbox is the control that confirms");
+    assert!(seen.borrow().jobs.is_empty(), "ticking sends nothing");
+    // The File menu has a "Print" entry too; the page's button is the wide one.
+    let print = h
+        .get_all_by_role_and_label(egui::accesskit::Role::Button, "Print")
+        .find(|node| node.rect().width() >= 300.0)
+        .expect("the Print page's button");
+    assert!(!print.accesskit_node().is_disabled(), "ticked and queried: Print is enabled");
+    print.click();
+    h.run_steps(4);
+    assert_eq!(seen.borrow().jobs.len(), 1, "one job started");
+    assert_eq!(seen.borrow().workers.len(), 1);
+    assert!(seen.borrow().workers[0].2, "the worker was given the confirmation");
+    assert!(!h.state().net_print.draft.confirmed, "the job spent it");
+}
+
+#[test]
+fn closing_and_reopening_the_print_page_clears_the_confirmation() {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let mut h = print_page(&seen);
+    h.get_by_label(CONFIRM).click();
+    h.run_steps(4);
+    assert!(h.state().net_print.draft.confirmed);
+    h.state_mut().run("ui.backstage", json!({"value": false})).unwrap();
+    h.run_steps(6);
+    assert!(h.state().net_print.draft.confirmed, "closing alone does not decide; reopening does");
+    h.state_mut().run("ui.backstage", json!({"value": true, "page": "print"})).unwrap();
+    h.run_steps(4);
+    assert!(!h.state().net_print.draft.confirmed, "a reopened page starts unconfirmed");
+    assert!(h.state().net_print.draft.printer().is_some(), "the queried printer is still there");
+    assert!(seen.borrow().jobs.is_empty(), "nothing was submitted");
 }
