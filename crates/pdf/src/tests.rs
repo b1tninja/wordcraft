@@ -1808,6 +1808,8 @@ fn image_budget_is_checked_from_the_header() {
     let dims = image::ImageReader::new(std::io::Cursor::new(hdr.as_slice())).with_guessed_format().unwrap().into_dimensions().unwrap();
     assert_eq!(dims, (30_000, 30_000));
     assert!(load_image(&Arc::new(hdr)).is_none());
+}
+
 /// The Print page's Grayscale box: every colour in the PDF is gray (Rec. 709), however the driver
 /// treats a monochrome request, and the setting does not leak into the next export.
 #[test]
@@ -1832,6 +1834,32 @@ fn grayscale_export_converts_colours_and_pictures() {
     let level = &y[..6];
     assert!(gray.contains(level), "the rectangle is filled with the Rec. 709 gray 53/255: {level}");
     assert!(raw(false).contains("1 0 0 rg"), "the next, colour export is unaffected");
+}
+
+/// Printing leaves the link annotations out (a clickable area prints as nothing, and a spooler
+/// that refits pages to the paper cannot move one) while the page itself is untouched: the
+/// words, the link colour and underline are the page's own content.
+#[test]
+fn annotations_off_drops_the_links_and_keeps_the_page() {
+    let d = sample();
+    let raw = |opts: &PdfOptions| String::from_utf8_lossy(&export(&d, &PdfOptions { compress: false, ..opts.clone() }).unwrap()).into_owned();
+    let on = raw(&PdfOptions::default());
+    let off = raw(&PdfOptions { annotations: false, ..Default::default() });
+    let tight = |s: &str| s.replace(' ', "");
+    let (on, off) = (tight(&on), tight(&off));
+    assert!(on.contains("/Annots") && on.contains("/Subtype/Link"), "links by default");
+    assert!(!off.contains("/Annots") && !off.contains("/Subtype/Link") && !off.contains("/URI"), "no annotation without them");
+    assert!(off.contains("/Outlines"), "the outline is not an annotation");
+    let with = export(&d, &PdfOptions::default()).unwrap();
+    let without = export(&d, &PdfOptions { annotations: false, ..Default::default() }).unwrap();
+    assert_eq!(extract_text(&with), extract_text(&without), "the same words");
+    let streams = |bytes: &[u8]| {
+        let pdf = hayro_syntax::Pdf::new(bytes.to_vec()).unwrap();
+        pdf.pages().iter().map(|p| p.page_stream().map(<[u8]>::to_vec).unwrap_or_default()).collect::<Vec<_>>()
+    };
+    let (a, b) = (streams(&with), streams(&without));
+    assert!(a.iter().all(|s| !s.is_empty()));
+    assert_eq!(a, b, "the same drawing on every page: the link underline and colour stay");
 }
 
 /// Scale to paper size (#2108): every page goes on the chosen paper, turned to the page's
@@ -1883,30 +1911,4 @@ fn pages_print_scaled_to_other_paper() {
         let bytes = export(&d, &PdfOptions { paper: Some(paper), ..Default::default() }).unwrap();
         assert_eq!(size(&bytes), size(&plain));
     }
-}
-
-/// Printing leaves the link annotations out (a clickable area prints as nothing, and a spooler
-/// that refits pages to the paper cannot move one) while the page itself is untouched: the
-/// words, the link colour and underline are the page's own content.
-#[test]
-fn annotations_off_drops_the_links_and_keeps_the_page() {
-    let d = sample();
-    let raw = |opts: &PdfOptions| String::from_utf8_lossy(&export(&d, &PdfOptions { compress: false, ..opts.clone() }).unwrap()).into_owned();
-    let on = raw(&PdfOptions::default());
-    let off = raw(&PdfOptions { annotations: false, ..Default::default() });
-    let tight = |s: &str| s.replace(' ', "");
-    let (on, off) = (tight(&on), tight(&off));
-    assert!(on.contains("/Annots") && on.contains("/Subtype/Link"), "links by default");
-    assert!(!off.contains("/Annots") && !off.contains("/Subtype/Link") && !off.contains("/URI"), "no annotation without them");
-    assert!(off.contains("/Outlines"), "the outline is not an annotation");
-    let with = export(&d, &PdfOptions::default()).unwrap();
-    let without = export(&d, &PdfOptions { annotations: false, ..Default::default() }).unwrap();
-    assert_eq!(extract_text(&with), extract_text(&without), "the same words");
-    let streams = |bytes: &[u8]| {
-        let pdf = hayro_syntax::Pdf::new(bytes.to_vec()).unwrap();
-        pdf.pages().iter().map(|p| p.page_stream().map(<[u8]>::to_vec).unwrap_or_default()).collect::<Vec<_>>()
-    };
-    let (a, b) = (streams(&with), streams(&without));
-    assert!(a.iter().all(|s| !s.is_empty()));
-    assert_eq!(a, b, "the same drawing on every page: the link underline and colour stay");
 }

@@ -107,7 +107,18 @@ pub struct PdfOptions {
 
 impl Default for PdfOptions {
     fn default() -> Self {
-        PdfOptions { pages: None, title: None, author: None, tagged: true, include_markup: false, comments: false, compress: true, paper: None, grayscale: false, annotations: true }
+        PdfOptions {
+            pages: None,
+            title: None,
+            author: None,
+            tagged: true,
+            include_markup: false,
+            comments: false,
+            compress: true,
+            paper: None,
+            grayscale: false,
+            annotations: true,
+        }
     }
 }
 
