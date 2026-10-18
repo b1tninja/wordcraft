@@ -8327,6 +8327,7 @@ fn toc_collects_cell_headings() {
         assert_eq!(targets["headings"].as_array().unwrap().len(), 0);
         assert!(s.doc.para(StoryRef::Body, &Path::top(1)).is_some());
     }
+}
 
 /// A print job with Print Markup ticked carries the comments as balloons in the page content,
 /// never as annotations: nothing in the job is a clickable area the spooler's fit could not move.
