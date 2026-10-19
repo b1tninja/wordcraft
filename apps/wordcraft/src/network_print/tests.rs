@@ -22,6 +22,8 @@ fn the_address_picks_the_protocol() {
         ("http://192.168.1.50/", Proto::Wsd),
         ("ipp://192.168.1.50/ipp/print", Proto::Ipp),
         ("IPP://192.168.1.50", Proto::Ipp),
+        ("ipps://192.168.1.50/ipp/print", Proto::Ipp),
+        ("IPPS://192.168.1.50:8443/printers/office", Proto::Ipp),
         ("http://192.168.1.50:631/printers/office", Proto::Ipp),
         ("http://192.168.1.50:8080/ipp/print", Proto::Ipp),
         ("http://192.168.1.50:5357/ippy", Proto::Wsd),
@@ -46,6 +48,45 @@ fn only_numeric_local_addresses_pass_the_policy() {
         let error = validate(bad).expect_err(bad);
         assert_eq!(error.kind, net::FailureKind::Policy, "{bad}");
     }
+}
+
+/// `ipps://` is IPP over TLS, which the IPP backend refuses as such: the error names TLS, not a
+/// WS-Print address.
+#[test]
+fn an_ipps_address_is_refused_by_the_ipp_policy() {
+    let error = validate("ipps://192.168.1.2/printers/office").expect_err("no TLS");
+    assert_eq!(error.kind, net::FailureKind::Policy);
+    assert!(error.detail.contains("TLS"), "{}", error.detail);
+}
+
+/// A worker thread that could not start is a failure the dialog hears, never a hang or a crash.
+#[test]
+fn a_worker_that_cannot_start_reports_a_failure() {
+    let (tx, rx) = mpsc::channel::<Result<(), net::Failure>>();
+    report_spawn(Err(std::io::Error::other("no threads left")), &tx);
+    let failure = rx.try_recv().expect("a failure was sent").expect_err("not a result");
+    assert_eq!(failure.kind, net::FailureKind::Other);
+    report_spawn(Ok(()), &tx);
+    assert!(rx.try_recv().is_err(), "a started worker reports for itself");
+}
+
+/// With no media named the job asks the printer to shrink what does not fit; a named media prints
+/// at actual size.
+#[test]
+fn a_job_without_media_is_shrunk_to_fit() {
+    let (job, _) = options(&request(), "x");
+    assert_eq!(job.scaling, Scaling::ShrinkToFit);
+    let with_media = net::Request { media_size: Some("na_letter_8.5x11in".into()), ..request() };
+    assert_eq!(options(&with_media, "x").0.scaling, Scaling::Exact);
+    // The WS-Print printer has no scaling setting: the job goes, with the note that it was not applied.
+    let fake = FakePrinter::new(FakeConfig::default());
+    let service = service_with(env_for(&fake));
+    let worker = (service.send)("x".into(), Arc::new(b"%PDF-1.7\n".to_vec()), true).expect("worker");
+    let report = worker(ADDRESS, request()).result.recv_timeout(WAIT).expect("ends").expect("accepted");
+    assert!(report.notes.iter().any(|note| note.contains("scaling")), "{report:?}");
+    let worker = (service.send)("x".into(), Arc::new(b"%PDF-1.7\n".to_vec()), true).expect("worker");
+    let report = worker(ADDRESS, with_media).result.recv_timeout(WAIT).expect("ends").expect("accepted");
+    assert!(!report.notes.iter().any(|note| note.contains("scaling")), "{report:?}");
 }
 
 #[test]

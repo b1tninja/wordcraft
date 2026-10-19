@@ -9,9 +9,9 @@
 //! registry refuses a network job without a [`UserConfirmed`]). Addresses are numeric private,
 //! link-local or loopback IPs, as craft-wsd's policy decides.
 //!
-//! The protocol follows the address: `ipp://...`, or a `/ipp/` path, or port 631 is IPP; anything
-//! else is WS-Print. All network work runs on its own threads; the UI thread only starts it and
-//! drains receivers.
+//! The protocol follows the address: `ipp://...` or `ipps://...` (refused by the IPP policy: no
+//! TLS yet), or a `/ipp/` path, or port 631 is IPP; anything else is WS-Print. All network work
+//! runs on its own threads; the UI thread only starts it and drains receivers.
 //!
 //! A job has two phases and so does its worker: it sends the document and reports **accepted** as
 //! soon as the printer has it, then follows the job with craft-print's `JobWatch`, reporting each
@@ -26,7 +26,8 @@ use craft_print::ipp::policy::PrinterUri;
 use craft_print::wsd::{PrinterUrl, WsdBackend};
 use craft_print::{
     CancelToken, ColourMode, Document, ErrorKind, Job, JobHint, JobOptions, JobState, JobStatus, JobWatch, Orientation, Phase, PrintError,
-    PrinterDetails, PrinterState, Quality, Registry, Resolution, SubmitRequest, UserConfirmed, WaitPolicy, WatchOutcome, WatchStep, namespaced_id,
+    PrinterDetails, PrinterState, Quality, Registry, Resolution, Scaling, SubmitRequest, UserConfirmed, WaitPolicy, WatchOutcome, WatchStep,
+    namespaced_id,
 };
 use craft_ui::capability::Capability;
 use craft_ui::printing::network as net;
@@ -56,7 +57,8 @@ fn proto_of(address: &str) -> Proto {
     let rest = lower.split_once("://").map_or(lower.as_str(), |(_, rest)| rest);
     let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
     let port_631 = authority.rsplit_once(':').is_some_and(|(_, port)| port == "631");
-    if lower.starts_with("ipp://") || port_631 || path.split('/').any(|segment| segment == "ipp") { Proto::Ipp } else { Proto::Wsd }
+    let ipp_scheme = lower.starts_with("ipp://") || lower.starts_with("ipps://");
+    if ipp_scheme || port_631 || path.split('/').any(|segment| segment == "ipp") { Proto::Ipp } else { Proto::Wsd }
 }
 
 /// The address checked against the network policy. The error is what the dialog shows under the field.
@@ -189,13 +191,28 @@ fn summary(details: &PrinterDetails) -> net::PrinterSummary {
     }
 }
 
+/// Start a worker thread. When the system can't start one, the receiver hears a failure at once
+/// instead of the work: nothing was sent.
+fn spawn_worker<T: Send + 'static>(name: &str, tx: &mpsc::Sender<Result<T, net::Failure>>, work: impl FnOnce() + Send + 'static) {
+    let started = std::thread::Builder::new().name(name.to_owned()).spawn(work);
+    report_spawn(started.map(|_| ()), tx);
+}
+
+/// What a worker that could not start tells its receiver.
+fn report_spawn<T>(started: std::io::Result<()>, tx: &mpsc::Sender<Result<T, net::Failure>>) {
+    if let Err(e) = started {
+        let _ = tx.send(Err(net::Failure::new(net::FailureKind::Other, format!("couldn't start the printing worker: {e}"))));
+    }
+}
+
 /// The worker that asks the printer at the (normalised) address what it is and what it lists. It
 /// sends no job.
 fn query_printer(env: Env, queried: Queried) -> net::QueryPrinter {
     Box::new(move |address: &str| {
         let (tx, rx) = mpsc::channel();
-        let (address, env, queried) = (address.to_owned(), env.clone(), Arc::clone(&queried));
-        std::thread::spawn(move || {
+        let (address, env, queried, worker_tx) = (address.to_owned(), env.clone(), Arc::clone(&queried), tx.clone());
+        spawn_worker("network-print-query", &tx, move || {
+            let tx = worker_tx;
             let result = match Printer::open(&address, &env) {
                 Ok(printer) => printer
                     .details()
@@ -221,6 +238,9 @@ fn options(request: &net::Request, job_name: &str) -> (Job, JobOptions) {
         job.title = name;
     }
     job.copies = request.copies.unwrap_or(1);
+    // With no media to name (mixed or unlisted sheet sizes) the printer is asked to shrink what
+    // does not fit, not to clip it; a named media prints at actual size.
+    job.scaling = if request.media_size.is_some() { Scaling::Exact } else { Scaling::ShrinkToFit };
     job.duplex = request.sides.map(|s| match s {
         net::Sides::OneSided => craft_print::Duplex::Off,
         net::Sides::LongEdge => craft_print::Duplex::LongEdge,
@@ -308,8 +328,9 @@ fn send_job(env: Env, name: String, pdf: Arc<Vec<u8>>, queried: Option<(String, 
         let (update_tx, update_rx) = mpsc::channel();
         let cancel = CancelToken::new();
         let (address, env) = (address.to_owned(), env.clone());
-        let (name, pdf, queried, worker_cancel) = (name.clone(), Arc::clone(&pdf), queried.clone(), cancel.clone());
-        std::thread::spawn(move || {
+        let (name, pdf, queried, worker_cancel, worker_tx) = (name.clone(), Arc::clone(&pdf), queried.clone(), cancel.clone(), result_tx.clone());
+        spawn_worker("network-print-job", &result_tx, move || {
+            let result_tx = worker_tx;
             let (job, options) = options(&request, &name);
             let result = run_job(&address, &env, (job, options), &pdf, queried, confirmed, &worker_cancel, &update_tx);
             let _ = result_tx.send(result);

@@ -15,7 +15,7 @@ pub fn commands(app: &crate::WordApp) -> Vec<serde_json::Value> {
     } else {
         app.services.print.is_some()
     };
-    let submit_params = "range?: all|current|selection|custom; pages?: string (1-3,5); parity?: all|odd|even; copies?: integer 1..999; collate?: bool; orientation?: auto|portrait|landscape; paper?: none|Letter|Legal|A4|… (Layout › Size names: Scale to paper size, every page scaled onto that paper and centred; the document is unchanged). Native uses the selected printer, duplex and grayscale from ui.printSettings; with a network printer chosen on the Print page the job goes to it only after its confirmation box was ticked there (never by a parameter); omitted copies/collation use current settings. Browser printing opens its dialog. Submits only when explicitly executed.";
+    let submit_params = "range?: all|current|selection|custom; pages?: string (1-3,5); parity?: all|odd|even; copies?: integer 1..999; collate?: bool; orientation?: auto|portrait|landscape; paper?: none|Letter|Legal|A4|… (Layout › Size names: Scale to paper size, every page scaled onto that paper and centred; the document is unchanged). Native uses the selected printer, duplex and grayscale from ui.printSettings; with a network printer chosen on the Print page the job goes to it only after its confirmation box was ticked there (never by a parameter), copies replaces that printer's Copies for this job (within the printer's maximum; one copy when it takes no copies setting) and the page orientation fills its Printer orientation when that is Auto; omitted copies/collation use current settings. Browser printing opens its dialog. Submits only when explicitly executed.";
     vec![
         json!({"id":"ui.printSettings", "label":"Print settings", "location":"File › Print", "shortcut":null,
             "params":"printer?: discovered name; copies?: integer 1..999; duplex?: printerDefault|off|longEdge|shortEdge|null; grayscale?: bool; refresh?: bool. Empty params inspect printer/copies/duplex/grayscale, printers, busy/discovering/ready and status/detail. Updates are atomic; refresh discovers only on native hosts. Never submits or opens a dialog.",
@@ -252,6 +252,28 @@ fn network_media(params: &serde_json::Value, sizes: &[(f32, f32)]) -> Option<&'s
     media.all(|m| m == Some(first)).then_some(first)
 }
 
+/// The page orientation of the job: `orientation` from the params or the Print page's choice, Auto
+/// read from the first page. `(landscape, chosen)`: `chosen` is false for Auto.
+fn page_orientation(app: &crate::WordApp, params: &serde_json::Value) -> (bool, bool) {
+    match params.get("orientation").and_then(|v| v.as_str()).unwrap_or(&app.ui.print.orientation) {
+        "landscape" => (true, true),
+        "portrait" => (false, true),
+        _ => (app.session.export_layout().pages.first().is_some_and(|p| p.w > p.h), false),
+    }
+}
+
+/// The orientation a network job asks for when its Printer orientation is Auto: the page
+/// orientation, as the spooler path asks for it. An Auto page that reads portrait asks for nothing
+/// (the printer's default).
+fn network_orientation(landscape: bool, chosen: bool) -> Option<craft_ui::printing::network::Orientation> {
+    use craft_ui::printing::network::Orientation;
+    match (landscape, chosen) {
+        (true, _) => Some(Orientation::Landscape),
+        (false, true) => Some(Orientation::Portrait),
+        (false, false) => None,
+    }
+}
+
 /// Build the upstream page-range/markup PDF and hand it to the chosen host print flow.
 pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<serde_json::Value, String> {
     use serde_json::json;
@@ -265,6 +287,10 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
         if app.net_print.draft.running() {
             return Err("A print job is already being sent.".into());
         }
+        // Refused before anything touches the document: no field update, no PDF.
+        if crate::network_print::blocked(app).is_some() {
+            return Err("Query the printer, then tick the confirmation box in File > Print before sending.".into());
+        }
     } else if native && !app.printing.ready() {
         return Err("Select an available printer in File > Print before submitting.".into());
     }
@@ -273,10 +299,13 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
     let mut pdf_params = job_params(params, gray);
     let mut settings = app.printing.settings.clone();
     let collate = params.get("collate").map(|value| value.as_bool().ok_or("collate must be a boolean")).transpose()?.unwrap_or(app.ui.print.collate);
+    // `copies` given with the command: the spooler's, or the network printer's for this job.
+    let mut job_copies = None;
     if native {
         let object = pdf_params.as_object_mut().ok_or("print settings must be an object")?;
         if let Some(copies) = object.get("copies") {
             settings.copies = copies.as_u64().filter(|copies| (1..=999).contains(copies)).ok_or("copies must be an integer from 1 to 999")? as u32;
+            job_copies = Some(settings.copies);
         }
         // Copies/collation belong to the spooler. Baking them into the PDF would multiply
         // the copies twice, and duplex could put the end of one copy behind the next.
@@ -296,9 +325,15 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
     if picture.is_some() {
         app.session.doc.settings.page_picture = picture;
     }
+    let (landscape, chosen) = if native { page_orientation(app, params) } else { (false, true) };
+    let net_orientation = network_orientation(landscape, chosen);
     let result = pdf.and_then(|(bytes, plan)| {
-        // The network printer takes its copies from its own section; the PDF has one.
-        let copies = if network { 1 } else { settings.copies as usize };
+        // The network printer takes its copies from its own section (or the command); the PDF has one.
+        let copies = if network {
+            crate::network_print::job_draft(&app.net_print.draft, job_copies, net_orientation).request(None).copies.unwrap_or(1) as usize
+        } else {
+            settings.copies as usize
+        };
         if native && plan.chosen.checked_mul(copies).is_none_or(|pages| pages > wordcraft_engine::print::MAX_PRINT_PAGES) {
             return Err("the selected pages and copies exceed the print-job page limit".into());
         }
@@ -308,25 +343,16 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
             let lay = app.session.export_layout();
             let sizes: Vec<(f32, f32)> = plan.pages.iter().filter_map(|&index| lay.pages.get(index)).map(|page| (page.w, page.h)).collect();
             let media = if sizes.len() == plan.pages.len() { network_media(params, &sizes) } else { None };
-            if !crate::network_print::send(app, bytes, plan.pages.len(), media) {
+            if !crate::network_print::send(app, bytes, plan.pages.len(), media, job_copies, net_orientation) {
                 return Err("Query the printer, then tick the confirmation box in File > Print before sending.".into());
             }
         } else if let Some(submit) = &app.services.print_native {
             let mut print_options = Vec::new();
-            let orientation = params.get("orientation").and_then(|v| v.as_str()).unwrap_or(&app.ui.print.orientation);
-            let is_landscape = if orientation == "landscape" {
-                true
-            } else if orientation == "portrait" {
-                false
-            } else {
-                let lay = app.session.export_layout();
-                lay.pages.first().is_some_and(|p| p.w > p.h)
-            };
             // Scale to paper size: ask the printer for that paper too, so it takes it from the right tray.
             if let Some(media) = wordcraft_engine::print::paper(params).ok().flatten().and_then(|(name, _, _)| pwg_media(name)) {
                 print_options.push(("media".into(), media.into()));
             }
-            if is_landscape {
+            if landscape {
                 print_options.push(("orientation-requested".into(), "4".into()));
                 print_options.push(("landscape".into(), "true".into()));
             } else {

@@ -82,13 +82,13 @@ fn nothing_is_sent_before_a_query_and_the_confirmation() {
 }
 
 #[test]
-fn a_confirmed_job_carries_the_pdf_one_copy_and_the_printers_own_settings() {
+fn a_confirmed_job_carries_the_pdf_one_copy_and_the_printers_own_settings_or_the_commands_copies() {
     let seen = Rc::new(RefCell::new(Seen::default()));
     let mut app = app_with(service(&seen, FORMATS, net::Outcome::Completed));
     query(&mut app);
     app.net_print.draft.confirmed = true;
     app.net_print.draft.copies = 3;
-    let reply = app.run("ui.print", json!({"copies": 5})).expect("the job starts");
+    let reply = app.run("ui.print", json!({})).expect("the job starts");
     assert_eq!(reply["network"], true);
     assert_eq!(reply["pending"], true);
     assert!(!app.net_print.draft.confirmed, "the confirmation is spent by the job");
@@ -105,6 +105,73 @@ fn a_confirmed_job_carries_the_pdf_one_copy_and_the_printers_own_settings() {
     assert!(app.run("ui.print", json!({})).is_err(), "a second job needs a new confirmation");
     app.net_print.poll(&egui::Context::default());
     assert!(matches!(app.net_print.draft.job, net::JobView::Finished(ref report) if report.printer == "Test Laser"));
+    // `copies` given with the command is this job's, as for the spooler; the section keeps its own.
+    app.net_print.draft.confirmed = true;
+    app.run("ui.print", json!({"copies": 5})).expect("the job starts");
+    assert_eq!(seen.borrow().jobs[1].1.copies, Some(5), "the command's copies are honoured");
+    assert_eq!(app.net_print.draft.copies, 3, "the section keeps the person's copies");
+    app.net_print.poll(&egui::Context::default());
+    app.net_print.draft.confirmed = true;
+    app.run("ui.print", json!({"copies": 50})).expect("the job starts");
+    assert_eq!(seen.borrow().jobs[2].1.copies, Some(9), "within the printer's maximum");
+}
+
+/// The page limit counts the copies the network job really asks for.
+#[test]
+fn the_page_limit_counts_the_network_jobs_copies() {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let mut app = app_with(service(&seen, FORMATS, net::Outcome::Completed));
+    for _ in 0..5 {
+        app.run("insert.pageBreak", json!({})).unwrap();
+    }
+    query(&mut app);
+    if let net::Query::Done(summary) = &mut app.net_print.draft.query {
+        summary.caps.copies = Capability::from_option_range(Some((1, 999)));
+    }
+    app.net_print.draft.confirmed = true;
+    let error = app.run("ui.print", json!({"copies": 999})).expect_err("6 pages x 999 copies is over the limit");
+    assert!(error.contains("page limit"), "{error}");
+    app.net_print.draft.copies = 999;
+    let error = app.run("ui.print", json!({})).expect_err("the section's copies count too");
+    assert!(error.contains("page limit"), "{error}");
+    assert!(seen.borrow().jobs.is_empty(), "no job started");
+    app.run("ui.print", json!({"copies": 800})).expect("4800 pages fit");
+    assert_eq!(seen.borrow().jobs[0].1.copies, Some(800));
+}
+
+/// A landscape document sent with Printer orientation on Auto asks the printer for landscape, as
+/// the spooler path does; an explicit Printer orientation wins.
+#[test]
+fn a_landscape_document_asks_a_network_printer_for_landscape() {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let mut app = app_with(service(&seen, FORMATS, net::Outcome::Completed));
+    app.run("layout.orientation", json!({"value": "landscape"})).unwrap();
+    query(&mut app);
+    assert_eq!(app.ui.print.orientation, "auto");
+    assert_eq!(app.net_print.draft.orientation, None, "Printer orientation: Auto");
+    app.net_print.draft.confirmed = true;
+    app.run("ui.print", json!({})).expect("starts");
+    assert_eq!(seen.borrow().jobs[0].1.orientation, Some(net::Orientation::Landscape));
+    assert_eq!(app.net_print.draft.orientation, None, "the section keeps Auto");
+    app.net_print.poll(&egui::Context::default());
+    app.net_print.draft.orientation = Some(net::Orientation::Portrait);
+    app.net_print.draft.confirmed = true;
+    app.run("ui.print", json!({})).expect("starts");
+    assert_eq!(seen.borrow().jobs[1].1.orientation, Some(net::Orientation::Portrait), "the printer's own choice wins");
+}
+
+/// A refused network print changes nothing: fields are not updated and no PDF is made.
+#[test]
+fn an_unconfirmed_print_leaves_the_document_unchanged() {
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let mut app = app_with(service(&seen, FORMATS, net::Outcome::Completed));
+    app.ui.update_fields_before_print = true;
+    let (rev, undo) = (app.session.rev(), app.session.undo_depth());
+    assert!(app.run("ui.print", json!({})).is_err(), "not queried");
+    query(&mut app);
+    assert!(app.run("ui.print", json!({})).is_err(), "not confirmed");
+    assert_eq!((app.session.rev(), app.session.undo_depth()), (rev, undo), "the document did not change");
+    assert!(seen.borrow().workers.is_empty(), "no PDF was handed over");
 }
 
 #[test]

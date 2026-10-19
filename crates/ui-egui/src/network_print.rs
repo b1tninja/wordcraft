@@ -60,7 +60,7 @@ pub fn labels() -> net::Labels<'static> {
         high: tl!("High"),
         photo: tl!("Photo"),
         color: tl!("Color:"),
-        color_color: tl!("Colour"),
+        color_color: tl!("Color"),
         color_monochrome: tl!("Grayscale"),
         resolution: tl!("Resolution:"),
         resolution_dpi: "{dpi} dpi",
@@ -127,10 +127,37 @@ pub fn show(app: &mut crate::WordApp, ui: &mut egui::Ui, sheets_ok: bool) -> Opt
     app.net_print.show(ui, egui::Id::new("wordcraft-network-printer"), &host, &labels()).block
 }
 
+/// What stops a network print before the document is made: no service, an address the policy
+/// refuses, a printer not queried (or that takes no PDF), a job running, or no confirmation.
+pub fn blocked(app: &crate::WordApp) -> Option<net::Block> {
+    let Some(service) = &app.services.print_network else { return Some(net::Block::Address) };
+    let address_ok = (service.validate)(&app.net_print.draft.normalized_url()).is_ok();
+    app.net_print.draft.block(address_ok, true, FORMATS)
+}
+
+/// The draft as one job sends it: `copies` (given with the print command) replaces the section's,
+/// and `orientation` (the page orientation) fills a Printer orientation left on Auto; an explicit
+/// choice there wins. The request still keeps only what the printer allows.
+pub fn job_draft(draft: &net::Draft, copies: Option<u32>, orientation: Option<net::Orientation>) -> net::Draft {
+    let mut draft = draft.clone();
+    if let Some(copies) = copies {
+        draft.copies = copies;
+    }
+    draft.orientation = draft.orientation.or(orientation);
+    draft
+}
+
 /// Start the job for the print-ready `pdf` of `pages` sheets (`media`: the sheet size, when the
-/// printers' list has it). It needs the person's confirmation, which it spends. `true` when a job
-/// started.
-pub fn send(app: &mut crate::WordApp, pdf: Vec<u8>, pages: usize, media: Option<&str>) -> bool {
+/// printers' list has it; `copies` and `orientation` as [`job_draft`] takes them, for this job
+/// only). It needs the person's confirmation, which it spends. `true` when a job started.
+pub fn send(
+    app: &mut crate::WordApp,
+    pdf: Vec<u8>,
+    pages: usize,
+    media: Option<&str>,
+    copies: Option<u32>,
+    orientation: Option<net::Orientation>,
+) -> bool {
     let Some(service) = &app.services.print_network else { return false };
     let name = app.title_stem();
     let address = app.net_print.draft.normalized_url();
@@ -138,7 +165,12 @@ pub fn send(app: &mut crate::WordApp, pdf: Vec<u8>, pages: usize, media: Option<
     let address_ok = (service.validate)(&address).is_ok();
     // The sheets are the pages of the document sent: the total shown until the printer reports one.
     app.net_print.draft.expected_pages = u32::try_from(pages).ok();
-    app.net_print.start_job(&worker, address_ok, true, FORMATS, media)
+    // The section keeps the person's own choices once the job has its own.
+    let kept = (app.net_print.draft.copies, app.net_print.draft.orientation);
+    app.net_print.draft = job_draft(&app.net_print.draft, copies, orientation);
+    let started = app.net_print.start_job(&worker, address_ok, true, FORMATS, media);
+    (app.net_print.draft.copies, app.net_print.draft.orientation) = kept;
+    started
 }
 
 /// Collect finished work (each frame), also while the Print page is closed: with the page gone the
@@ -171,6 +203,16 @@ pub fn poll(app: &mut crate::WordApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wording uses the interface's US spelling.
+    #[test]
+    fn labels_use_us_spelling() {
+        let labels = labels();
+        assert_eq!(labels.color_color, "Color");
+        for text in [labels.color, labels.color_color, labels.canceling, labels.outcome_canceled, labels.failure_stopped] {
+            assert!(!text.contains("olour") && !text.contains("ancell"), "{text}");
+        }
+    }
 
     #[test]
     fn sheet_sizes_map_to_media_names_in_either_orientation() {
