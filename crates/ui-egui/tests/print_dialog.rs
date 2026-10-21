@@ -21,7 +21,11 @@ fn app(jobs: &Jobs) -> WordApp {
     app.ui.print_backgrounds = true;
     app.services.printers = Some(Box::new(|| {
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(vec![Printer { name: "Office laser".into(), default: false }, Printer { name: "Front desk".into(), default: true }]).unwrap();
+        tx.send(vec![
+            Printer { name: "Office laser".into(), label: String::new(), default: false },
+            Printer { name: "Front desk".into(), label: String::new(), default: true },
+        ])
+        .unwrap();
         rx
     }));
     let seen = jobs.clone();
