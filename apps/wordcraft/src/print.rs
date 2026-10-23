@@ -1,4 +1,5 @@
 //! Desktop spooler adapter. Discovery and submission never run on the UI thread.
+use std::time::{Duration, Instant};
 use wordcraft_ui_egui::printing::{Discover, Duplex, Printer, Settings, Submit};
 
 pub fn discover() -> Discover {
@@ -19,12 +20,48 @@ pub fn discover() -> Discover {
 // let process exit kill PowerShell/CUPS before it hands the job to the spooler.
 static JOBS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
 
+/// How long shutdown waits for submission workers: long enough for a normal handover to the
+/// spooler, short enough that a stalled driver cannot keep a closed window's process alive.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(25);
+
 pub fn finish_pending_jobs() {
-    let workers = std::mem::take(&mut *JOBS.lock().unwrap_or_else(|poison| poison.into_inner()));
-    for worker in workers {
-        if worker.join().is_err() {
-            log::error!("the print worker stopped unexpectedly during shutdown");
+    finish_pending_jobs_within(SHUTDOWN_DEADLINE);
+}
+
+/// Wait up to `deadline` in total for the submission workers, joining each one that finishes.
+/// Never blocks past the deadline.
+pub fn finish_pending_jobs_within(deadline: Duration) {
+    let mut workers = std::mem::take(&mut *JOBS.lock().unwrap_or_else(|poison| poison.into_inner()));
+    join_within(&mut workers, deadline);
+}
+
+/// Join the finished workers in `workers`, polling until `deadline` has passed. Workers still
+/// running at the deadline are left in the list (and dropped by the caller, which detaches them).
+fn join_within(workers: &mut Vec<std::thread::JoinHandle<()>>, deadline: Duration) {
+    let end = Instant::now() + deadline;
+    loop {
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].is_finished() {
+                if workers.swap_remove(index).join().is_err() {
+                    log::error!("the print worker stopped unexpectedly during shutdown");
+                }
+            } else {
+                index += 1;
+            }
         }
+        if workers.is_empty() || Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !workers.is_empty() {
+        // Not a failure and not known to be safe to retry: the job may or may not have reached the
+        // queue, so the print queue should be checked.
+        log::warn!(
+            "{} print job(s) were still being handed to the spooler after {deadline:?};              shutdown continued without them. Check the print queue before printing again",
+            workers.len()
+        );
     }
 }
 
@@ -93,5 +130,28 @@ mod tests {
         shutdown.join().unwrap();
         completion.recv().unwrap();
         assert!(JOBS.lock().unwrap().is_empty(), "workers were joined before shutdown returned");
+    }
+
+    #[test]
+    fn a_stalled_worker_cannot_hold_shutdown_past_the_deadline() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let stalled = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let finished = std::thread::spawn(move || done_tx.send(()).unwrap());
+        done_rx.recv().unwrap();
+        let mut workers = vec![stalled, finished];
+        let started = Instant::now();
+        join_within(&mut workers, Duration::from_millis(200));
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_secs(5), "the wait returned at its deadline, took {waited:?}");
+        assert!(waited >= Duration::from_millis(200), "a normal handover is given the whole deadline");
+        assert_eq!(workers.len(), 1, "the completed handover was joined; only the stalled one is left");
+        assert!(!workers[0].is_finished());
+        release.send(()).unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 }
