@@ -176,6 +176,23 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     app.net_print.dialog_opened();
                 }
                 app.net_print_page_pass = pass;
+                // #2958: as in Word, the page's action leads the settings, in the accent the app
+                // gives a dialog's primary button: the first thing seen, and plainly a button
+                // that prints now rather than one more setting in the list below.
+                {
+                    let network = app.ui.print.network;
+                    let native = app.services.print_native.is_some() && !network;
+                    let hook = native || network || app.services.print.is_some();
+                    let print_ready = if network {
+                        crate::network_print::blocked(app).is_none() && !app.net_print.draft.running()
+                    } else {
+                        !native || app.printing.ready()
+                    };
+                    if hook && ui.add_enabled(print_ready, crate::widgets::primary_button(ui, tl!("Print")).min_size(vec2(320.0, 34.0))).clicked() {
+                        let params = app.ui.print.params();
+                        let _ = app.run("ui.print", params);
+                    }
+                }
                 // One Printer list: the system's queues, then "Network printer…".
                 if let Some(discover) = &app.services.printers
                     && app.services.print_native.is_some()
@@ -189,9 +206,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 let network = app.ui.print.network;
                 let native = app.services.print_native.is_some() && !network;
                 let hook = native || network || app.services.print.is_some();
-                let mut network_block = None;
                 if network {
-                    network_block = crate::network_print::show(
+                    let _ = crate::network_print::show(
                         app,
                         ui,
                         wordcraft_engine::print::plan(&app.ui.print.params(), total, current).is_ok() && total > 0,
@@ -207,16 +223,6 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     );
                 } else {
                     ui.label(tl!("Save a copy in another format. Printing goes through a PDF you can print from any viewer."));
-                }
-                ui.add_space(4.0);
-                let print_ready = if network { network_block.is_none() && !app.net_print.draft.running() } else { !native || app.printing.ready() };
-                if hook
-                    && ui
-                        .add_enabled(print_ready, egui::Button::new(egui::RichText::new(tl!("Print")).font(medium(13.5))).min_size(vec2(320.0, 34.0)))
-                        .clicked()
-                {
-                    let params = app.ui.print.params();
-                    let _ = app.run("ui.print", params);
                 }
                 if ui
                     .add(egui::Button::new(egui::RichText::new(tl!("Save these pages as PDF…")).font(medium(13.5))).min_size(vec2(320.0, 34.0)))
