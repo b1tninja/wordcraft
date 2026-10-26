@@ -49,7 +49,7 @@ pub fn show_picker(
         state.refresh(discover);
     }
     state.poll(ui.ctx());
-    ui.push_id(egui::Id::new("wordcraft_print_settings"), |ui| {
+    ui.push_id(egui::Id::unique("wordcraft_print_settings"), |ui| {
         ui.add_enabled_ui(!state.busy() && !locked, |ui| {
             let width = ui.available_width().clamp(32.0, 230.0);
             let label = ui.label(translate("Printer"));
@@ -92,7 +92,7 @@ pub fn show_picker(
 /// A local queue's copies, two-sided choice and Grayscale box.
 pub fn show_options(state: &mut State, ui: &mut egui::Ui, translate: impl Fn(&str) -> String) {
     let width = ui.available_width().clamp(32.0, 230.0);
-    ui.push_id(egui::Id::new("wordcraft_print_options"), |ui| {
+    ui.push_id(egui::Id::unique("wordcraft_print_options"), |ui| {
         ui.add_enabled_ui(!state.busy(), |ui| {
             ui.horizontal(|ui| {
                 let label = ui.label(translate("Copies"));

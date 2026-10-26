@@ -2,6 +2,8 @@
 use std::time::{Duration, Instant};
 use wordcraft_ui_egui::printing::{Discover, Duplex, Printer, Settings, Submit};
 
+/// Returns a discovery callback that enumerates spooler printers on a named worker thread and
+/// sends the list through a channel, keeping spooler calls off the UI thread.
 pub fn discover() -> Discover {
     Box::new(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -17,7 +19,7 @@ pub fn discover() -> Discover {
 }
 
 // Keep submission workers reachable until normal app shutdown; dropping a JoinHandle would
-// let process exit kill PowerShell/CUPS before it hands the job to the spooler.
+// let process exit end an in-process Windows job or the CUPS hand-off before the spooler has it.
 static JOBS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
 
 /// How long shutdown waits for submission workers: long enough for a normal handover to the
@@ -31,7 +33,7 @@ pub fn finish_pending_jobs() {
 /// Wait up to `deadline` in total for the submission workers, joining each one that finishes.
 /// Never blocks past the deadline.
 pub fn finish_pending_jobs_within(deadline: Duration) {
-    let mut workers = std::mem::take(&mut *JOBS.lock().unwrap_or_else(|poison| poison.into_inner()));
+    let mut workers = std::mem::take(&mut *JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     join_within(&mut workers, deadline);
 }
 
@@ -94,7 +96,7 @@ pub fn submit() -> Submit {
             let _ = sender.send(craft_print::submit(&bytes, &job).map_err(|error| error.to_string()));
         });
         if let Ok(worker) = worker {
-            let mut jobs = JOBS.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut jobs = JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             jobs.retain(|job| !job.is_finished());
             jobs.push(worker);
         }

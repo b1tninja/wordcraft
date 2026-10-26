@@ -124,7 +124,7 @@ pub fn media_for_points(width: f32, height: f32) -> Option<&'static str> {
 pub fn show(app: &mut crate::WordApp, ui: &mut egui::Ui, sheets_ok: bool) -> Option<net::Block> {
     let Some(service) = &app.services.print_network else { return Some(net::Block::Address) };
     let host = net::Host { validate: &service.validate, query: &service.query, sheets_ok, formats: FORMATS };
-    app.net_print.show(ui, egui::Id::new("wordcraft-network-printer"), &host, &labels()).block
+    app.net_print.show(ui, egui::Id::unique("wordcraft-network-printer"), &host, &labels()).block
 }
 
 /// What stops a network print before the document is made: no service, an address the policy
