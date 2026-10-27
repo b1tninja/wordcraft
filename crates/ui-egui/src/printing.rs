@@ -61,7 +61,7 @@ pub fn show_picker(
             } else {
                 state.settings.printer.clone()
             };
-            egui::ComboBox::from_id_salt("printer")
+            craft_ui::ComboBox::from_id_salt("printer")
                 .width(width)
                 .wrap_mode(egui::TextWrapMode::Truncate)
                 .selected_text(shown)
@@ -107,7 +107,7 @@ pub fn show_options(state: &mut State, ui: &mut egui::Ui, translate: impl Fn(&st
             let duplex_label = ui.label(translate("Two-sided printing"));
             let shown =
                 choices.iter().find(|(value, _)| *value == state.settings.duplex).map_or_else(|| translate("Printer default"), |(_, t)| t.clone());
-            egui::ComboBox::from_id_salt("duplex")
+            craft_ui::ComboBox::from_id_salt("duplex")
                 .width(width)
                 .wrap_mode(egui::TextWrapMode::Truncate)
                 .selected_text(shown)
